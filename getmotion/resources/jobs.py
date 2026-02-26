@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..exceptions import JobFailedError, WaitTimeout
-from .storyboard import StoryboardSession
+from .storyboard import StoryboardSession, _wait_for_storyboard_session
 
 if TYPE_CHECKING:
     from .._http import HttpClient
@@ -57,9 +57,15 @@ class Job:
         deadline = time.monotonic() + timeout
         logger.debug("waiting for job=%s status=%s (timeout=%ss)", self.id, status, timeout)
 
+        _last_detail: str | None = None
         while True:
             data = self.status()
             current = data.get("status", "")
+
+            detail = data.get("step_detail")
+            if detail and detail != _last_detail:
+                logger.info("job=%s  %s", self.id, detail)
+                _last_detail = detail
 
             if current == status:
                 logger.debug("job=%s reached status=%s", self.id, status)
@@ -156,19 +162,35 @@ class Job:
     # Storyboard
     # ------------------------------------------------------------------
 
-    def init_storyboard(self, style: str = "default", force: bool = False) -> StoryboardSession:
+    def init_storyboard(
+        self,
+        style: str = "default",
+        force: bool = False,
+        timeout: int = 600,
+        poll_interval: int = 3,
+    ) -> StoryboardSession:
         """
         Initialise (or resume) a storyboard editing session.
 
         If a session already exists for this job it is returned as-is.
         Pass force=True to discard the existing session and generate a new one.
+
+        Generation is async server-side: the call blocks locally, polling until
+        the storyboard is ready (up to *timeout* seconds).
         """
         logger.debug("init storyboard job=%s style=%s force=%s", self.id, style, force)
         data = self._http.post(
             "/storyboard/init",
             json={"job_id": self.id, "style": style, "force": force},
-            timeout=None,  # LLM pipeline runs synchronously, no upper bound
         )
+
+        # API returns 202 when a new storyboard needs to be generated — poll until ready.
+        if "session_id" not in data:
+            logger.info("job=%s  Storyboard generation queued, waiting…", self.id)
+            data = _wait_for_storyboard_session(
+                self._http, self.id, timeout=timeout, poll_interval=poll_interval
+            )
+
         return StoryboardSession(
             session_id=data["session_id"],
             job_id=data["job_id"],

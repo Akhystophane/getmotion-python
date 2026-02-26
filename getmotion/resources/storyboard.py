@@ -1,12 +1,61 @@
 from __future__ import annotations
 
 import logging
+import time as _time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .._http import HttpClient
 
 logger = logging.getLogger("getmotion")
+
+
+def _wait_for_storyboard_session(
+    http: "HttpClient",
+    job_id: str,
+    timeout: int = 600,
+    poll_interval: int = 3,
+) -> dict[str, Any]:
+    """Poll until GET /jobs/{job_id}/storyboard returns exists=True.
+
+    Also checks job status on each tick for step_detail progress and FAILED transitions.
+    Raises JobFailedError or WaitTimeout as appropriate.
+    """
+    from ..exceptions import JobFailedError, WaitTimeout
+
+    deadline = _time.monotonic() + timeout
+    _last_detail: str | None = None
+    logger.debug("waiting for storyboard job=%s (timeout=%ss)", job_id, timeout)
+
+    while True:
+        data = http.get(f"/jobs/{job_id}/storyboard")
+        if data.get("exists"):
+            return data
+
+        # Not ready — check job status for progress and failure
+        try:
+            status_data = http.get(f"/jobs/{job_id}/status")
+            detail = status_data.get("step_detail")
+            if detail and detail != _last_detail:
+                logger.info("job=%s  %s", job_id, detail)
+                _last_detail = detail
+            if status_data.get("status") == "FAILED":
+                error = status_data.get("error") or {}
+                raise JobFailedError(
+                    f"Job {job_id!r} failed: {error.get('detail', 'unknown error')}",
+                    job_id=job_id,
+                    code=error.get("code"),
+                    detail=error.get("detail"),
+                )
+        except JobFailedError:
+            raise
+        except Exception:
+            pass
+
+        if _time.monotonic() >= deadline:
+            raise WaitTimeout(job_id, "STORYBOARD_READY", timeout)
+
+        _time.sleep(poll_interval)
 
 
 class StoryboardSession:
@@ -89,7 +138,12 @@ class StoryboardSession:
         )
         logger.debug("storyboard finalized, blueprint generation triggered job=%s", self.job_id)
 
-    def regenerate(self, style: str = "default") -> "StoryboardSession":
+    def regenerate(
+        self,
+        style: str = "default",
+        timeout: int = 600,
+        poll_interval: int = 3,
+    ) -> "StoryboardSession":
         """
         Discard the current storyboard and generate a fresh one.
 
@@ -97,9 +151,14 @@ class StoryboardSession:
         after this call.
         """
         logger.debug("regenerating storyboard job=%s", self.job_id)
-        data = self._http.post(
+        self._http.post(
             "/storyboard/init",
             json={"job_id": self.job_id, "style": style, "force": True},
+        )
+        # force=True always enqueues (returns 202) — poll until ready
+        logger.info("job=%s  Storyboard regeneration queued, waiting…", self.job_id)
+        data = _wait_for_storyboard_session(
+            self._http, self.job_id, timeout=timeout, poll_interval=poll_interval
         )
         return StoryboardSession(
             session_id=data["session_id"],
