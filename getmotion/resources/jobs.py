@@ -41,12 +41,28 @@ class Job:
             dict with the following keys:
 
             - ``job_id`` (str): The job identifier.
-            - ``status`` (str): Current status, e.g. ``"CREATED"``,
-              ``"AWAITING_REVIEW"``, ``"COMPLETED"``.
-            - ``status_label`` (str): Human-readable status label.
-            - ``stage`` (str): Pipeline stage — one of ``"analyze"``,
-              ``"review"``, ``"compose"``, ``"render"``, ``"done"``,
-              ``"error"``.
+            - ``status`` (str): Current status value. See
+              :meth:`wait_for` for the full list of possible values.
+            - ``status_label`` (str): Human-readable label for the
+              current status, e.g. ``"Analyzing your audio…"``.
+            - ``stage`` (str): High-level pipeline stage. One of:
+
+              - ``"analyze"`` — audio is being transcribed and assets
+                gathered (statuses: ``CREATED``, ``QUEUED_COMPOSE_PRE``,
+                ``RUNNING_COMPOSE_PRE``).
+              - ``"review"`` — AI proposal is ready and waiting for
+                user input (statuses: ``STORYBOARD_DRAFT``,
+                ``AWAITING_REVIEW``).
+              - ``"compose"`` — storyboard is being validated and a
+                render blueprint generated (statuses:
+                ``QUEUED_COMPOSE_POST``, ``RUNNING_COMPOSE_POST``,
+                ``READY_FOR_INJECT``).
+              - ``"render"`` — GPU worker is rendering the video
+                (statuses: ``QUEUED_INJECT``, ``RUNNING_INJECT``).
+              - ``"done"`` — video is complete (status: ``COMPLETED``).
+              - ``"error"`` — job stopped with an error or was cancelled
+                (statuses: ``FAILED``, ``CANCELLED``).
+
             - ``progress`` (float | None): Completion estimate from 0.0
               to 1.0, if available.
             - ``step_detail`` (str | None): Human-readable progress
@@ -79,8 +95,44 @@ class Job:
         """Block until the job reaches *status*, then return the status payload.
 
         Args:
-            status: Target status string to wait for, e.g.
-                ``"AWAITING_REVIEW"`` or ``"COMPLETED"``.
+            status: Target status string to wait for. Valid values and
+                when to use them:
+
+                +--------------------------+-------------------------------------------+
+                | Status                   | Meaning                                   |
+                +==========================+===========================================+
+                | ``CREATED``              | Job created, not yet started.             |
+                +--------------------------+-------------------------------------------+
+                | ``QUEUED_COMPOSE_PRE``   | Queued for audio analysis.                |
+                +--------------------------+-------------------------------------------+
+                | ``RUNNING_COMPOSE_PRE``  | AI is transcribing audio & picking assets.|
+                +--------------------------+-------------------------------------------+
+                | ``AWAITING_REVIEW``      | Proposal ready — call                     |
+                |                          | :meth:`get_proposal` now.                 |
+                +--------------------------+-------------------------------------------+
+                | ``STORYBOARD_DRAFT``     | Storyboard generation in progress.        |
+                +--------------------------+-------------------------------------------+
+                | ``QUEUED_COMPOSE_POST``  | Queued for blueprint generation.          |
+                +--------------------------+-------------------------------------------+
+                | ``RUNNING_COMPOSE_POST`` | Blueprint being compiled.                 |
+                +--------------------------+-------------------------------------------+
+                | ``READY_FOR_INJECT``     | Blueprint ready — call :meth:`render` now.|
+                +--------------------------+-------------------------------------------+
+                | ``QUEUED_INJECT``        | Queued for GPU rendering.                 |
+                +--------------------------+-------------------------------------------+
+                | ``RUNNING_INJECT``       | GPU worker is rendering the video.        |
+                +--------------------------+-------------------------------------------+
+                | ``COMPLETED``            | Render done — call :meth:`get_renders`.   |
+                +--------------------------+-------------------------------------------+
+                | ``FAILED``               | Job failed (triggers :exc:`JobFailedError`|
+                |                          | automatically).                           |
+                +--------------------------+-------------------------------------------+
+                | ``CANCELLED``            | Job was cancelled.                        |
+                +--------------------------+-------------------------------------------+
+
+                The two most common values to wait for are
+                ``"AWAITING_REVIEW"`` (after :meth:`start`) and
+                ``"COMPLETED"`` (after :meth:`render`).
             timeout: Maximum seconds to wait before raising
                 :exc:`WaitTimeout`. Defaults to 300.
             poll_interval: Seconds between status polls. Defaults to 3.

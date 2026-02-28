@@ -12,29 +12,33 @@ _DEFAULT_BASE_URL = "https://api.getmotion.io"
 
 
 class GetMotion:
-    """
-    GetMotion API client.
+    """Top-level GetMotion API client.
 
-    Usage::
+    Create a single instance and reuse it across your application.  The
+    client manages an underlying HTTP connection pool; always close it when
+    you are done, either by calling :meth:`close` explicitly or by using the
+    client as a context manager::
 
-        from getmotion import GetMotion
+        # Context manager (recommended)
+        with GetMotion(api_key="gm-...") as client:
+            job = client.jobs.create(title="my-video")
+            ...
 
+        # Manual close
         client = GetMotion(api_key="gm-...")
-        job = client.jobs.create(title="my-video")
-        job.upload_audio("voiceover.mp3")
-        job.start()
+        try:
+            job = client.jobs.create(title="my-video")
+            ...
+        finally:
+            client.close()
+    """
 
-        job.wait_for("AWAITING_REVIEW")
-        proposal = job.get_proposal()
-        job.submit_review(proposal)
+    jobs: JobsResource
+    """Entry point for all job operations.
 
-        session = job.init_storyboard()
-        session.chat("make the transitions snappier")
-        session.finalize()
-
-        job.render()
-        job.wait_for("DONE")
-        renders = job.get_renders()
+    Use ``client.jobs.create()`` to start a new job or
+    ``client.jobs.get(job_id)`` to resume an existing one.
+    See :class:`JobsResource` for the full API.
     """
 
     def __init__(
@@ -46,10 +50,15 @@ class GetMotion:
     ):
         """
         Args:
-            api_key:  Your GetMotion API key.
-            base_url: Override the API base URL (useful for self-hosted or staging).
-            timeout:  HTTP request timeout in seconds.
-            debug:    Enable verbose request/response logging.
+            api_key: Your GetMotion API key (starts with ``gm-``).
+            base_url: Override the API base URL. Useful for self-hosted
+                instances or staging environments.
+                Defaults to ``https://api.getmotion.io``.
+            timeout: HTTP request timeout in seconds. Applies to every
+                request except storyboard chat (which is LLM-backed and
+                has no timeout). Defaults to 60.
+            debug: Set to ``True`` to enable verbose request/response
+                logging via the ``getmotion`` logger.
         """
         if debug:
             logging.getLogger("getmotion").setLevel(logging.DEBUG)
