@@ -63,6 +63,17 @@ class StoryboardSession:
     Represents an active storyboard editing session for a job.
 
     Obtain via job.init_storyboard().
+
+    Attributes:
+        session_id (str): Unique session identifier.
+        job_id (str): The job this session belongs to.
+        storyboard_key (str): S3 key of the current storyboard JSON.
+            Updated in-place after each :meth:`chat` edit.
+        version (int): Current revision number. Incremented on each
+            edit.
+        high_level_summary (dict): Segment/macro overview of the
+            storyboard — ``{"segments": [...], "stats":
+            {"total_segments": int, "total_macros": int}}``.
     """
 
     def __init__(
@@ -82,7 +93,15 @@ class StoryboardSession:
         self._http = http
 
     def get(self) -> "StoryboardSession":
-        """Refresh session state from the API."""
+        """Refresh session state from the API.
+
+        Updates ``storyboard_key``, ``version``, and
+        ``high_level_summary`` in place from the latest server state.
+
+        Returns:
+            ``self``, with attributes updated to the current server
+            state.
+        """
         data = self._http.get(f"/storyboard/{self.session_id}")
         self.storyboard_key = data["storyboard_key"]
         self.version = data["version"]
@@ -90,10 +109,19 @@ class StoryboardSession:
         return self
 
     def chat(self, message: str) -> str:
-        """
-        Send a natural-language instruction to the storyboard LLM.
+        """Send a natural-language instruction to the storyboard LLM.
 
-        Updates the session in place and returns the assistant reply.
+        The session's ``storyboard_key``, ``version``, and
+        ``high_level_summary`` are updated in place when the LLM makes
+        edits to the storyboard.
+
+        Args:
+            message: Plain-English instruction, e.g.
+                ``"Make the transitions snappier"`` or
+                ``"Replace the intro clip with something more dynamic"``.
+
+        Returns:
+            The assistant's reply as a plain string.
         """
         logger.debug("storyboard chat session=%s message=%r", self.session_id, message)
         data = self._http.post(
@@ -109,16 +137,21 @@ class StoryboardSession:
         return data["reply"]
 
     def finalize(self) -> None:
-        """
-        Finalize the storyboard and trigger blueprint generation (compose_post).
+        """Finalize the storyboard and trigger blueprint generation (compose_post).
 
         Internally:
-          1. POST /storyboard/{session_id}/finalize
-          2. POST /jobs/{job_id}/review with the returned storyboard_key
-             (this triggers compose_post server-side)
 
-        After this call the job status transitions to READY_FOR_INJECT
-        and job.render() can be called.
+        1. ``POST /storyboard/{session_id}/finalize``
+        2. ``POST /jobs/{job_id}/review`` with the returned
+           ``storyboard_key`` — this triggers ``compose_post``
+           server-side.
+
+        After this call the job status transitions to
+        ``READY_FOR_INJECT`` and :meth:`job.render()
+        <getmotion.resources.jobs.Job.render>` can be called.
+
+        Returns:
+            None
         """
         logger.debug("finalizing storyboard session=%s", self.session_id)
 
@@ -144,11 +177,27 @@ class StoryboardSession:
         timeout: int = 600,
         poll_interval: int = 3,
     ) -> "StoryboardSession":
-        """
-        Discard the current storyboard and generate a fresh one.
+        """Discard the current storyboard and generate a fresh one.
 
-        Returns a new StoryboardSession — the current session is no longer valid
-        after this call.
+        The current session is no longer valid after this call — use
+        the returned session object going forward.
+
+        Args:
+            style: Storyboard generation style for the new session.
+                Defaults to ``"default"``.
+            timeout: Maximum seconds to wait for generation to complete.
+                Defaults to 600.
+            poll_interval: Seconds between readiness polls. Defaults
+                to 3.
+
+        Returns:
+            A new :class:`StoryboardSession` for the regenerated
+            storyboard.
+
+        Raises:
+            JobFailedError: if the job fails during regeneration.
+            WaitTimeout: if *timeout* seconds elapse before the new
+                storyboard becomes available.
         """
         logger.debug("regenerating storyboard job=%s", self.job_id)
         self._http.post(

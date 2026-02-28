@@ -35,7 +35,39 @@ class Job:
     # ------------------------------------------------------------------
 
     def status(self) -> dict[str, Any]:
-        """Return current job status detail from the API."""
+        """Return current job status detail from the API.
+
+        Returns:
+            dict with the following keys:
+
+            - ``job_id`` (str): The job identifier.
+            - ``status`` (str): Current status, e.g. ``"CREATED"``,
+              ``"AWAITING_REVIEW"``, ``"COMPLETED"``.
+            - ``status_label`` (str): Human-readable status label.
+            - ``stage`` (str): Pipeline stage — one of ``"analyze"``,
+              ``"review"``, ``"compose"``, ``"render"``, ``"done"``,
+              ``"error"``.
+            - ``progress`` (float | None): Completion estimate from 0.0
+              to 1.0, if available.
+            - ``step_detail`` (str | None): Human-readable progress
+              message, e.g. ``"Rendering: 45%"``.
+            - ``created_at`` (str | None): ISO-format creation timestamp.
+            - ``updated_at`` (str | None): ISO-format last-update
+              timestamp.
+            - ``error`` (dict | None): Present on failure. Contains
+              ``"code"`` (str | None) and ``"detail"`` (str | None).
+            - ``input_s3_key`` (str | None): S3 key of the uploaded audio.
+            - ``proposal_s3_key`` (str | None): S3 key of the generated
+              proposal.
+            - ``current_blueprint_key`` (str | None): S3 key of the
+              active blueprint.
+            - ``next_action`` (dict | None): Populated when
+              ``status == "AWAITING_REVIEW"``; contains ``"kind"``,
+              ``"review_token"``, ``"proposal_key"``, and optionally
+              ``"proposal_url"``.
+            - ``last_transition`` (dict | None): Most recent status
+              transition record.
+        """
         return self._http.get(f"/jobs/{self.id}/status")
 
     def wait_for(
@@ -44,14 +76,27 @@ class Job:
         timeout: int = 300,
         poll_interval: int = 3,
     ) -> dict[str, Any]:
-        """
-        Block until the job reaches *status*, then return the status payload.
+        """Block until the job reaches *status*, then return the status payload.
+
+        Args:
+            status: Target status string to wait for, e.g.
+                ``"AWAITING_REVIEW"`` or ``"COMPLETED"``.
+            timeout: Maximum seconds to wait before raising
+                :exc:`WaitTimeout`. Defaults to 300.
+            poll_interval: Seconds between status polls. Defaults to 3.
+
+        Returns:
+            The status dict at the moment the target status was reached.
+            Same shape as :meth:`status`.
 
         Raises:
-            JobFailedError: if the job transitions to FAILED before reaching *status*.
-            WaitTimeout: if *timeout* seconds elapse without reaching *status*.
+            JobFailedError: if the job transitions to FAILED before
+                reaching *status*.
+            WaitTimeout: if *timeout* seconds elapse without reaching
+                *status*.
 
-        Example:
+        Example::
+
             job.wait_for("AWAITING_REVIEW", timeout=600)
         """
         deadline = time.monotonic() + timeout
@@ -90,10 +135,19 @@ class Job:
     # ------------------------------------------------------------------
 
     def upload_audio(self, path: str | Path, content_type: str | None = None) -> None:
-        """
-        Presign and upload an audio file to the job's S3 input folder.
+        """Presign and upload an audio file to the job's S3 input folder.
 
         Supports .mp3, .wav, .m4a and other audio formats.
+
+        Args:
+            path: Local path to the audio file.
+            content_type: MIME type of the file, e.g. ``"audio/mpeg"``.
+                Inferred from the file extension when omitted.
+
+        Raises:
+            FileNotFoundError: if *path* does not exist on disk.
+            httpx.HTTPStatusError: if the presign request or S3 upload
+                fails.
         """
         import httpx
 
@@ -133,12 +187,44 @@ class Job:
             logger.debug("audio uploaded job=%s key=%s", self.id, target["key"])
 
     def start(self, input_s3_key: Optional[str] = None) -> dict[str, Any]:
-        """Queue compose_pre — kicks off transcription and asset gathering."""
+        """Queue compose_pre — kicks off transcription and asset gathering.
+
+        Args:
+            input_s3_key: Override the S3 key of the audio input. When
+                omitted the key set during :meth:`upload_audio` is used.
+
+        Returns:
+            dict with:
+
+            - ``job_id`` (str): The job identifier.
+            - ``queued`` (str): ``"COMPOSE_PRE"`` when successfully
+              queued. If the job was already processing, ``status``
+              (str) is returned instead.
+        """
         params = f"?input_s3_key={input_s3_key}" if input_s3_key else ""
         return self._http.post(f"/jobs/{self.id}/start{params}")
 
     def get_proposal(self) -> dict[str, Any]:
-        """Return the domain mapping proposal generated by compose_pre."""
+        """Return the domain mapping proposal generated by compose_pre.
+
+        The proposal maps each domain (footage, icons, text, etc.) to
+        the assets chosen by the AI.  Inspect and optionally edit the
+        returned dict, then pass it to :meth:`submit_review`.
+
+        Returns:
+            dict representing the domain mapping. Top-level keys
+            correspond to asset domains, e.g.:
+
+            - ``footage`` — background video clips
+            - ``icon`` — icon assets
+            - ``person`` — on-screen people / avatars
+            - ``logo`` — brand logo
+            - ``main_asset`` — primary hero asset
+            - ``text`` — text / copy overrides
+            - ``sound`` — background music / SFX
+            - ``color`` — colour palette
+            - ``blur`` — blur / overlay settings
+        """
         data = self._http.get(f"/jobs/{self.id}/review/domain_mapping")
         return data["domain_mapping"]
 
@@ -147,11 +233,25 @@ class Job:
         decisions: dict[str, Any],
         review_token: Optional[str] = None,
     ) -> dict[str, Any]:
-        """
-        Save the domain mapping review decisions.
+        """Save the domain mapping review decisions.
 
-        This is called after the user inspects and edits the proposal.
-        It does NOT trigger rendering — call job.init_storyboard() next.
+        This is called after the user inspects and edits the proposal
+        returned by :meth:`get_proposal`. It does NOT trigger rendering
+        — call :meth:`init_storyboard` next.
+
+        Args:
+            decisions: The domain mapping dict to submit (typically the
+                object returned by :meth:`get_proposal`, optionally
+                modified).
+            review_token: Optional token from the job's ``next_action``
+                payload. Not required in most integrations.
+
+        Returns:
+            dict with:
+
+            - ``ok`` (bool): ``True`` on success.
+            - ``submitted_key`` (str): S3 key where the submission was
+              persisted.
         """
         body: dict[str, Any] = {"decisions_json": decisions}
         if review_token:
@@ -169,14 +269,41 @@ class Job:
         timeout: int = 600,
         poll_interval: int = 3,
     ) -> StoryboardSession:
-        """
-        Initialise (or resume) a storyboard editing session.
+        """Initialise (or resume) a storyboard editing session.
 
         If a session already exists for this job it is returned as-is.
-        Pass force=True to discard the existing session and generate a new one.
+        Pass ``force=True`` to discard the existing session and generate
+        a new one.
 
-        Generation is async server-side: the call blocks locally, polling until
-        the storyboard is ready (up to *timeout* seconds).
+        Generation is async server-side: the call blocks locally,
+        polling until the storyboard is ready (up to *timeout* seconds).
+
+        Args:
+            style: Storyboard generation style. Defaults to
+                ``"default"``.
+            force: Discard any existing session and generate a new
+                storyboard from scratch.
+            timeout: Maximum seconds to wait for generation to complete.
+                Defaults to 600.
+            poll_interval: Seconds between readiness polls. Defaults
+                to 3.
+
+        Returns:
+            A :class:`StoryboardSession` with the following attributes:
+
+            - ``session_id`` (str)
+            - ``job_id`` (str)
+            - ``storyboard_key`` (str): S3 key of the storyboard JSON.
+            - ``version`` (int): Current revision number.
+            - ``high_level_summary`` (dict): Segment/macro overview —
+              ``{"segments": [...], "stats": {"total_segments": int,
+              "total_macros": int}}``.
+
+        Raises:
+            JobFailedError: if the job fails while waiting for the
+                storyboard to be ready.
+            WaitTimeout: if *timeout* seconds elapse before the
+                storyboard becomes available.
         """
         logger.debug("init storyboard job=%s style=%s force=%s", self.id, style, force)
         data = self._http.post(
@@ -205,15 +332,25 @@ class Job:
     # ------------------------------------------------------------------
 
     def render(self, force: bool = False, keep_bin: bool = False) -> dict[str, Any]:
-        """
-        Queue the job for rendering on the GPU worker.
+        """Queue the job for rendering on the GPU worker.
 
-        The job must be in READY_FOR_INJECT status (i.e. storyboard must be
-        finalized first via session.finalize()).
+        The job must be in ``READY_FOR_INJECT`` status (i.e. storyboard
+        must be finalized first via :meth:`session.finalize()
+        <StoryboardSession.finalize>`).
 
         Args:
             force: Re-render even if renders already exist.
             keep_bin: Skip DaVinci bin cleanup after render (advanced).
+
+        Returns:
+            dict with:
+
+            - ``job_id`` (str): The job identifier.
+            - ``status`` (str): ``"QUEUED_INJECT"`` when successfully
+              queued, or the current status string if a render was
+              already in progress.
+            - ``message`` (str): Human-readable confirmation, e.g.
+              ``"Render queued"`` or ``"Already rendering"``.
         """
         params: list[str] = []
         if force:
@@ -224,12 +361,27 @@ class Job:
         return self._http.post(f"/jobs/{self.id}/render{qs}")
 
     def get_renders(self, version: Optional[str] = None) -> dict[str, Any]:
-        """
-        Return renders for this job.
+        """Return renders for this job.
+
+        Fetches the latest render version by default. Use
+        :meth:`list_render_versions` to enumerate all available
+        versions.
 
         Args:
-            version: Blueprint version to fetch (e.g. "v2").
-                     Defaults to the latest available version.
+            version: Blueprint version to fetch (e.g. ``"v2"``).
+                Defaults to the latest available version.
+
+        Returns:
+            dict with:
+
+            - ``renders`` (list[dict]): List of render entries, each
+              containing:
+
+              - ``s3_key`` (str): S3 object key of the render file.
+              - ``url`` (str | None): Presigned download URL (if
+                available).
+              - ``etag`` (str | None): S3 ETag.
+              - ``bytes`` (int | None): File size in bytes.
         """
         if version:
             return self._http.get(f"/jobs/{self.id}/renders/versions/{version}")
@@ -241,7 +393,15 @@ class Job:
         return self._http.get(f"/jobs/{self.id}/renders/versions/{latest['version']}")
 
     def list_render_versions(self) -> list[dict[str, Any]]:
-        """Return all available render versions for this job."""
+        """Return all available render versions for this job.
+
+        Returns:
+            list of version dicts, ordered oldest-first. Each dict
+            contains at minimum:
+
+            - ``version`` (str): Version identifier used with
+              :meth:`get_renders`.
+        """
         data = self._http.get(f"/jobs/{self.id}/renders/versions")
         return data.get("versions", [])
 
@@ -261,14 +421,19 @@ class JobsResource:
         idempotency_key: Optional[str] = None,
         want_upload_url: bool = False,
     ) -> Job:
-        """
-        Create a new job.
+        """Create a new job.
 
         Args:
-            title: Human-readable name, also used as the job_id (alphanumeric/hyphens).
-                   A UUID is generated if omitted.
-            idempotency_key: Re-using the same key returns the existing job.
-            want_upload_url: Request a presigned upload URL in the response.
+            title: Human-readable name, also used as the job ID
+                (alphanumeric and hyphens only). A UUID is generated
+                when omitted.
+            idempotency_key: Re-using the same key returns the existing
+                job instead of creating a new one.
+            want_upload_url: Request a presigned S3 upload URL in the
+                response (accessible via ``job._data["upload_url"]``).
+
+        Returns:
+            A :class:`Job` instance with ``job.id`` populated.
         """
         body: dict[str, Any] = {"want_upload_url": want_upload_url}
         if title:
@@ -280,6 +445,16 @@ class JobsResource:
         return Job(job_id=data["job_id"], http=self._http, data=data)
 
     def get(self, job_id: str) -> Job:
-        """Fetch an existing job by id."""
+        """Fetch an existing job by ID.
+
+        Args:
+            job_id: The job identifier to look up.
+
+        Returns:
+            A :class:`Job` instance for the given *job_id*.
+
+        Raises:
+            NotFoundError: if no job with *job_id* exists.
+        """
         data = self._http.get(f"/jobs/{job_id}")
         return Job(job_id=data["job_id"], http=self._http, data=data)
