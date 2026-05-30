@@ -53,7 +53,7 @@ def _wait_for_storyboard_session(
             pass
 
         if _time.monotonic() >= deadline:
-            raise WaitTimeout(job_id, "STORYBOARD_READY", timeout)
+            raise WaitTimeout(job_id, "STORYBOARD_DRAFT (storyboard.exists)", timeout)
 
         _time.sleep(poll_interval)
 
